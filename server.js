@@ -1,38 +1,64 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const mongoose = require('mongoose');
+const sqlite3 = require('sqlite3');
+const { open } = require('sqlite');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
 
-// Подключаемся к MongoDB (локальной или в облаке)
-mongoose.connect('mongodb://127.0.0.1:27017/messenger')
-  .then(() => console.log("БД подключена"))
-  .catch(err => console.log("Ошибка БД:", err));
-
-// Схема сообщения
-const MessageSchema = new mongoose.Schema({
-  user: String,
-  text: String,
-  timestamp: { type: Date, default: Date.now }
+// Настройка CORS важна для того, чтобы мобильное приложение могло подключиться
+const io = new Server(server, {
+  cors: {
+    origin: "*", 
+    methods: ["GET", "POST"]
+  }
 });
-const Message = mongoose.model('Message', MessageSchema);
 
-io.on('connection', async (socket) => {
-  console.log('User connected:', socket.id);
-
-  // 1. При подключении отправляем историю сообщений
-  const history = await Message.find().sort({ timestamp: 1 }).limit(50);
-  socket.emit('load_history', history);
-
-  // 2. Слушаем новое сообщение
-  socket.on('send_message', async (data) => {
-    const newMessage = new Message({ user: data.user, text: data.text });
-    await newMessage.save(); // Сохраняем в базу
-    io.emit('receive_message', newMessage); // Рассылаем всем
+(async () => {
+  // Инициализация базы данных SQLite
+  const db = await open({
+    filename: './database.sqlite',
+    driver: sqlite3.Database
   });
-});
 
-server.listen(3000, '0.0.0.0', () => console.log(`Сервер: http://192.168.64.186:3000`));
+  // Создание таблицы сообщений
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user TEXT,
+      text TEXT,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  io.on('connection', async (socket) => {
+    console.log('User connected:', socket.id);
+
+    // Отправляем историю при подключении
+    try {
+      const history = await db.all("SELECT user, text FROM messages ORDER BY timestamp ASC LIMIT 50");
+      socket.emit('load_history', history);
+    } catch (err) {
+      console.log("History error:", err);
+    }
+
+    // Обработка нового сообщения
+    socket.on('send_message', async (data) => {
+      if (data.user && data.text) {
+        await db.run("INSERT INTO messages (user, text) VALUES (?, ?)", [data.user, data.text]);
+        io.emit('receive_message', data); // Рассылка всем
+      }
+    });
+
+    socket.on('disconnect', () => {
+      console.log('User disconnected');
+    });
+  });
+
+  // Render сам подставит нужный PORT
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server is running on port ${PORT}`);
+  });
+})();
