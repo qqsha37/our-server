@@ -3,6 +3,7 @@ const http = require('http');
 const { Server } = require('socket.io');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const fs = require('fs');
 const cors = require('cors');
 
 const app = express();
@@ -11,79 +12,135 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
-const db = new sqlite3.Database('./database.sqlite');
+const dbPath = path.resolve(__dirname, 'database.sqlite');
 
-db.serialize(() => {
-  // Пользователи
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, 
-    email TEXT UNIQUE, display_name TEXT, username TEXT UNIQUE, password TEXT, bio TEXT
-  )`);
-  // Группы / Чаты
-  db.run(`CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, owner_id INTEGER, is_private INTEGER DEFAULT 0
-  )`);
-  // Участники чатов
-  db.run(`CREATE TABLE IF NOT EXISTS group_members (
-    group_id INTEGER, user_id INTEGER, UNIQUE(group_id, user_id)
-  )`);
-  // Сообщения
-  db.run(`CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER, sender_id INTEGER, sender_name TEXT, text TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+let db;
+function initDb() {
+  db = new sqlite3.Database(dbPath);
+  db.serialize(() => {
+    // Пользователи
+    db.run(`CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, 
+      email TEXT UNIQUE, 
+      display_name TEXT, 
+      username TEXT UNIQUE, 
+      password TEXT
+    )`);
+    
+    // Контакты (друзья)
+    db.run(`CREATE TABLE IF NOT EXISTS contacts (
+      user_id INTEGER, 
+      contact_id INTEGER,
+      UNIQUE(user_id, contact_id)
+    )`);
+
+    // Группы
+    db.run(`CREATE TABLE IF NOT EXISTS groups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, 
+      name TEXT, 
+      description TEXT,
+      owner_id INTEGER,
+      is_group INTEGER DEFAULT 1
+    )`);
+
+    // Участники групп
+    db.run(`CREATE TABLE IF NOT EXISTS group_members (
+      group_id INTEGER, 
+      user_id INTEGER
+    )`);
+
+    // Сообщения
+    db.run(`CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, 
+      group_id INTEGER, 
+      sender_id INTEGER,
+      sender_name TEXT,
+      text TEXT, 
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+  });
+}
+initDb();
+
+// Поиск пользователя по юзернейму
+app.get('/users/search/:username', (req, res) => {
+  const search = req.params.username.trim().toLowerCase();
+  const query = search.startsWith('@') ? search : `@${search}`;
+  db.get("SELECT id, display_name, username FROM users WHERE username = ?", [query], (err, row) => {
+    if (row) res.json(row);
+    else res.status(404).json({ error: "Пользователь не найден" });
+  });
 });
 
-// API Эндпоинты
+// Добавить в друзья
+app.post('/contacts/add', (req, res) => {
+  const { user_id, contact_id } = req.body;
+  db.run("INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)", [user_id, contact_id], () => {
+    res.json({ success: true });
+  });
+});
+
+// Получить список друзей
+app.get('/contacts/:userId', (req, res) => {
+  db.all(`SELECT u.id, u.display_name, u.username FROM users u 
+          JOIN contacts c ON u.id = c.contact_id WHERE c.user_id = ?`, [req.params.userId], (err, rows) => {
+    res.json(rows || []);
+  });
+});
+
+// Создание группы
+app.post('/groups/create', (req, res) => {
+  const { name, description, owner_id, members } = req.body;
+  db.run("INSERT INTO groups (name, description, owner_id) VALUES (?, ?, ?)", [name, description, owner_id], function(err) {
+    const groupId = this.lastID;
+    const allMembers = [...members, owner_id];
+    const stmt = db.prepare("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)");
+    allMembers.forEach(mId => stmt.run(groupId, mId));
+    stmt.finalize();
+    res.json({ success: true, id: groupId });
+  });
+});
+
+// Получить чаты пользователя (и группы, и личные)
+app.get('/my-chats/:userId', (req, res) => {
+  db.all(`SELECT g.* FROM groups g 
+          JOIN group_members gm ON g.id = gm.group_id 
+          WHERE gm.user_id = ?`, [req.params.userId], (err, rows) => {
+    res.json(rows || []);
+  });
+});
+
+// Стандартные эндпоинты (Login/Register/Reset) остаются из прошлых версий...
 app.post('/register', (req, res) => {
   const { email, display_name, username, password } = req.body;
-  db.run("INSERT INTO users (email, display_name, username, password) VALUES (?, ?, ?, ?)", 
-    [email, display_name, username, password], (err) => {
-      if (err) res.status(400).json({ error: "Ошибка регистрации" });
-      else res.json({ success: true });
+  const e = email.trim().toLowerCase();
+  const u = username.trim().startsWith('@') ? username.trim() : `@${username.trim()}`;
+  db.run("INSERT INTO users (email, display_name, username, password) VALUES (?, ?, ?, ?)", [e, display_name, u, password], (err) => {
+    if (err) return res.status(400).json({ error: "Занято" });
+    res.json({ success: true });
   });
 });
 
 app.post('/login', (req, res) => {
   const { email, password } = req.body;
-  db.get("SELECT * FROM users WHERE email = ? AND password = ?", [email, password], (err, row) => {
-    if (row) res.json(row);
-    else res.status(401).json({ error: "Неверные данные" });
+  db.get("SELECT * FROM users WHERE email = ? AND password = ?", [email.trim().toLowerCase(), password.trim()], (err, row) => {
+    if (row) res.json({ success: true, ...row });
+    else res.status(401).json({ error: "Ошибка" });
   });
 });
 
-app.get('/my-chats/:uid', (req, res) => {
-  const query = `
-    SELECT g.* FROM groups g 
-    JOIN group_members gm ON g.id = gm.group_id 
-    WHERE gm.user_id = ? OR g.owner_id = ?`;
-  db.all(query, [req.params.uid, req.params.uid], (err, rows) => res.json(rows || []));
+app.post('/admin/nuclear-reset', (req, res) => {
+  db.close(() => { fs.unlinkSync(dbPath); initDb(); io.emit('FORCE_LOGOUT'); res.json({ success: true }); });
 });
 
-app.post('/groups/create', (req, res) => {
-  const { name, owner_id, members, is_private } = req.body;
-  db.run("INSERT INTO groups (name, owner_id, is_private) VALUES (?, ?, ?)", [name, owner_id, is_private], function() {
-    const gid = this.lastID;
-    const allMembers = [owner_id, ...members];
-    allMembers.forEach(uid => db.run("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", [gid, uid]));
-    res.json({ id: gid });
-  });
-});
-
-// Socket.io Логика
 io.on('connection', (socket) => {
-  socket.on('join', (groupId) => {
-    socket.join(`room_${groupId}`);
-    db.all("SELECT * FROM messages WHERE group_id = ? ORDER BY timestamp ASC", [groupId], (err, rows) => {
-      socket.emit('history', rows || []);
-    });
-  });
-
+  socket.on('join', (id) => socket.join(`room_${id}`));
   socket.on('msg', (data) => {
     db.run("INSERT INTO messages (group_id, sender_id, sender_name, text) VALUES (?, ?, ?, ?)", 
-      [data.group_id, data.sender_id, data.sender_name, data.text], function() {
-        io.to(`room_${data.group_id}`).emit('msg', data);
+    [data.group_id, data.sender_id, data.sender_name, data.text], function() {
+      io.to(`room_${data.group_id}`).emit('msg', { ...data, id: this.lastID });
     });
   });
 });
 
-server.listen(3000, () => console.log('Server running on port 3000'));
+server.listen(10000, '0.0.0.0');
