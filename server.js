@@ -18,6 +18,7 @@ let db;
 function initDb() {
   db = new sqlite3.Database(dbPath);
   db.serialize(() => {
+    // Таблица пользователей
     db.run(`CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       email TEXT UNIQUE, 
@@ -26,12 +27,14 @@ function initDb() {
       password TEXT
     )`);
     
+    // Друзья
     db.run(`CREATE TABLE IF NOT EXISTS contacts (
       user_id INTEGER, 
       contact_id INTEGER,
       UNIQUE(user_id, contact_id)
     )`);
 
+    // Группы
     db.run(`CREATE TABLE IF NOT EXISTS groups (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       name TEXT, 
@@ -40,11 +43,13 @@ function initDb() {
       is_group INTEGER DEFAULT 1
     )`);
 
+    // Участники
     db.run(`CREATE TABLE IF NOT EXISTS group_members (
       group_id INTEGER, 
       user_id INTEGER
     )`);
 
+    // Сообщения (добавлено поле timestamp)
     db.run(`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       group_id INTEGER, 
@@ -57,7 +62,7 @@ function initDb() {
 }
 initDb();
 
-// ПОИСК: Находит пользователя по @username
+// Эндпоинты API
 app.get('/users/search/:username', (req, res) => {
   const search = req.params.username.trim().toLowerCase();
   const query = search.startsWith('@') ? search : `@${search}`;
@@ -67,7 +72,7 @@ app.get('/users/search/:username', (req, res) => {
   });
 });
 
-// ИСТОРИЯ: Загрузка сообщений для конкретного чата
+// НОВОЕ: Получение истории сообщений
 app.get('/messages/:groupId', (req, res) => {
   db.all("SELECT * FROM messages WHERE group_id = ? ORDER BY timestamp ASC", [req.params.groupId], (err, rows) => {
     res.json(rows || []);
@@ -113,7 +118,7 @@ app.post('/register', (req, res) => {
   const e = email.trim().toLowerCase();
   const u = username.trim().startsWith('@') ? username.trim() : `@${username.trim()}`;
   db.run("INSERT INTO users (email, display_name, username, password) VALUES (?, ?, ?, ?)", [e, display_name, u, password], (err) => {
-    if (err) return res.status(400).json({ error: "Email или Username уже заняты" });
+    if (err) return res.status(400).json({ error: "Занято" });
     res.json({ success: true });
   });
 });
@@ -122,22 +127,21 @@ app.post('/login', (req, res) => {
   const { email, password } = req.body;
   db.get("SELECT * FROM users WHERE email = ? AND password = ?", [email.trim().toLowerCase(), password.trim()], (err, row) => {
     if (row) res.json({ success: true, ...row });
-    else res.status(401).json({ error: "Неверные данные" });
+    else res.status(401).json({ error: "Ошибка входа" });
   });
 });
 
-// SOCKET.IO: Живое общение
+// Socket.io логика
 io.on('connection', (socket) => {
   socket.on('join', (id) => socket.join(`room_${id}`));
-  
   socket.on('msg', (data) => {
     db.run("INSERT INTO messages (group_id, sender_id, sender_name, text) VALUES (?, ?, ?, ?)", 
     [data.group_id, data.sender_id, data.sender_name, data.text], function() {
-      const newMessage = { ...data, id: this.lastID, timestamp: new Date().toISOString() };
-      io.to(`room_${data.group_id}`).emit('msg', newMessage);
+      const savedMsg = { ...data, id: this.lastID, timestamp: new Date().toISOString() };
+      io.to(`room_${data.group_id}`).emit('msg', savedMsg);
     });
   });
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`Сервер запущен на порту ${PORT}`));
