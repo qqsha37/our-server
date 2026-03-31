@@ -32,6 +32,7 @@ function initDb() {
     db.run(`CREATE TABLE IF NOT EXISTS groups (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       name TEXT, 
+      description TEXT,
       owner_id INTEGER,
       is_private INTEGER DEFAULT 0
     )`);
@@ -43,6 +44,19 @@ function initDb() {
       sender_name TEXT,
       text TEXT, 
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
+
+    // НОВЫЕ ТАБЛИЦЫ ДЛЯ ДРУЗЕЙ И УЧАСТНИКОВ ГРУПП
+    db.run(`CREATE TABLE IF NOT EXISTS contacts (
+      user_id INTEGER,
+      contact_id INTEGER,
+      PRIMARY KEY (user_id, contact_id)
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS group_members (
+      group_id INTEGER,
+      user_id INTEGER,
+      PRIMARY KEY (group_id, user_id)
     )`);
 
     db.run("INSERT OR IGNORE INTO groups (id, name, owner_id) VALUES (1, 'Общий чат', 0)");
@@ -59,10 +73,7 @@ app.post('/register', (req, res) => {
 
   db.run("INSERT INTO users (email, display_name, username, password) VALUES (?, ?, ?, ?)", 
     [email, display_name.trim(), nick, password], function(err) {
-      if (err) {
-        console.error("Ошибка регистрации:", err.message);
-        return res.status(400).json({ error: "Email или Username уже заняты" });
-      }
+      if (err) return res.status(400).json({ error: "Email или Username уже заняты" });
       res.json({ success: true, id: this.lastID });
     });
 });
@@ -70,23 +81,79 @@ app.post('/register', (req, res) => {
 app.post('/login', (req, res) => {
   const email = req.body.email.trim().toLowerCase();
   const password = req.body.password.trim();
-
-  console.log(`Попытка входа: ${email}`); // Для отладки в логах Render
-
   db.get("SELECT * FROM users WHERE email = ? AND password = ?", [email, password], (err, row) => {
     if (err) return res.status(500).json({ error: "Ошибка БД" });
-    if (row) {
-      console.log(`Успешный вход: ${row.username}`);
-      res.json({ success: true, ...row });
-    } else {
-      console.log(`Неудачный вход для: ${email}`);
-      res.status(401).json({ error: "Неверная почта или пароль" });
-    }
+    if (row) res.json({ success: true, ...row });
+    else res.status(401).json({ error: "Неверная почта или пароль" });
   });
 });
 
-app.get('/groups', (req, res) => {
-  db.all("SELECT * FROM groups", (err, rows) => res.json(rows || []));
+// НОВЫЙ ЭНДПОИНТ: Поиск пользователя
+app.get('/users/search/:username', (req, res) => {
+  const q = req.params.username.trim();
+  const nick = q.startsWith('@') ? q : `@${q}`;
+  
+  db.get("SELECT id, username, display_name FROM users WHERE username = ?", [nick], (err, row) => {
+    if (row) res.json(row);
+    else res.status(404).json({ error: "Не найден" });
+  });
+});
+
+// НОВЫЙ ЭНДПОИНТ: Добавить в друзья
+app.post('/contacts/add', (req, res) => {
+  const { user_id, contact_id } = req.body;
+  if (user_id === contact_id) return res.status(400).json({ error: "Нельзя добавить себя" });
+  
+  db.run("INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)", [user_id, contact_id], (err) => {
+    if (err) return res.status(500).json({ error: "Ошибка БД" });
+    res.json({ success: true });
+  });
+});
+
+// НОВЫЙ ЭНДПОИНТ: Получить список друзей
+app.get('/contacts/:uid', (req, res) => {
+  db.all(`
+    SELECT u.id, u.username, u.display_name 
+    FROM contacts c 
+    JOIN users u ON c.contact_id = u.id 
+    WHERE c.user_id = ?
+  `, [req.params.uid], (err, rows) => {
+    res.json(rows || []);
+  });
+});
+
+// НОВЫЙ ЭНДПОИНТ: Создать группу
+app.post('/groups/create', (req, res) => {
+  const { name, description, owner_id, members } = req.body;
+  
+  db.run("INSERT INTO groups (name, description, owner_id) VALUES (?, ?, ?)", [name, description, owner_id], function(err) {
+    if (err) return res.status(500).json({ error: "Ошибка создания" });
+    const groupId = this.lastID;
+    
+    // Добавляем создателя и выбранных друзей в группу
+    let allMembers = [owner_id, ...(members || [])];
+    allMembers = [...new Set(allMembers)]; // Убираем дубликаты
+    
+    const placeholders = allMembers.map(() => "(?, ?)").join(",");
+    const values = allMembers.flatMap(uid => [groupId, uid]);
+    
+    db.run(`INSERT INTO group_members (group_id, user_id) VALUES ${placeholders}`, values, () => {
+      res.json({ success: true, id: groupId });
+    });
+  });
+});
+
+// НОВЫЙ ЭНДПОИНТ: Получить список чатов пользователя
+app.get('/my-chats/:uid', (req, res) => {
+  // Выводим Общий чат (owner=0) ИЛИ те чаты, где юзер есть в участниках
+  db.all(`
+    SELECT g.* FROM groups g
+    LEFT JOIN group_members gm ON g.id = gm.group_id
+    WHERE g.owner_id = 0 OR gm.user_id = ?
+    GROUP BY g.id
+  `, [req.params.uid], (err, rows) => {
+    res.json(rows || []);
+  });
 });
 
 app.post('/admin/nuclear-reset', (req, res) => {
