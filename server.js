@@ -11,88 +11,119 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
+const dbPath = path.resolve(__dirname, 'database.sqlite');
+let db = new sqlite3.Database(dbPath);
 
-const db = new sqlite3.Database(path.resolve(__dirname, 'database.sqlite'));
+const initDb = (database) => {
+  database.serialize(() => {
+    // Пользователи (добавлени даты рождения)
+    database.run(`CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, 
+      email TEXT UNIQUE, 
+      display_name TEXT, 
+      username TEXT UNIQUE, 
+      password TEXT,
+      birth_date TEXT
+    )`);
+    
+    // Группы (добавлен owner_id)
+    database.run(`CREATE TABLE IF NOT EXISTS groups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, 
+      name TEXT, 
+      owner_id INTEGER,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
 
-db.serialize(() => {
-  // Пользователи
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, 
-    email TEXT UNIQUE, 
-    display_name TEXT, 
-    username TEXT UNIQUE, 
-    password TEXT
-  )`);
-  
-  // Группы
-  db.run(`CREATE TABLE IF NOT EXISTS groups (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, 
-    name TEXT, 
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
+    // Участники групп
+    database.run(`CREATE TABLE IF NOT EXISTS group_members (
+      group_id INTEGER,
+      user_id INTEGER
+    )`);
 
-  // Сообщения (привязаны к group_id)
-  db.run(`CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, 
-    group_id INTEGER, 
-    user TEXT, 
-    text TEXT, 
-    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-
-  // Создаем одну общую группу по умолчанию, если её нет
-  db.get("SELECT * FROM groups WHERE id = 1", (err, row) => {
-    if (!row) db.run("INSERT INTO groups (id, name) VALUES (1, 'Общий чат')");
+    // Сообщения (добавлен id и тип)
+    database.run(`CREATE TABLE IF NOT EXISTS messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, 
+      group_id INTEGER, 
+      sender_id INTEGER,
+      user TEXT, 
+      text TEXT, 
+      is_pinned INTEGER DEFAULT 0,
+      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`);
   });
-});
+};
 
-// Регистрация
+initDb(db);
+
+// API Эндпоинты
 app.post('/register', (req, res) => {
   const { email, display_name, username, password } = req.body;
-  const formattedUser = username.startsWith('@') ? username : `@${username}`;
   db.run("INSERT INTO users (email, display_name, username, password) VALUES (?, ?, ?, ?)", 
-    [email, display_name, formattedUser, password], (err) => {
-      if (err) return res.status(400).json({ error: "Email или Username уже заняты" });
-      res.json({ success: true });
+    [email, display_name, username, password], function(err) {
+      if (err) return res.status(400).json({ error: "Ошибка регистрации" });
+      res.json({ success: true, id: this.lastID });
     });
 });
 
-// Вход
 app.post('/login', (req, res) => {
   const { email, password } = req.body;
   db.get("SELECT * FROM users WHERE email = ? AND password = ?", [email, password], (err, row) => {
-    if (row) res.json({ success: true, username: row.username, display_name: row.display_name });
+    if (row) res.json({ success: true, ...row });
     else res.status(401).json({ error: "Неверные данные" });
   });
 });
 
-// Список групп
-app.get('/groups', (req, res) => {
+// Поиск пользователя по юзернейму
+app.get('/users/search/:query', (req, res) => {
+  db.all("SELECT id, username, display_name, email FROM users WHERE username LIKE ?", [`%${req.params.query}%`], (err, rows) => {
+    res.json(rows || []);
+  });
+});
+
+// Группы
+app.get('/groups/:userId', (req, res) => {
   db.all("SELECT * FROM groups", (err, rows) => res.json(rows || []));
 });
 
-// Создание группы
 app.post('/groups', (req, res) => {
-  db.run("INSERT INTO groups (name) VALUES (?)", [req.body.name], function(err) {
+  const { name, owner_id } = req.body;
+  db.run("INSERT INTO groups (name, owner_id) VALUES (?, ?)", [name, owner_id], function(err) {
     res.json({ success: true, id: this.lastID });
   });
 });
 
+// УДАЛЕНИЕ ВСЕЙ БАЗЫ (STUFF DADB)
+app.post('/stuff/dadb', (req, res) => {
+  db.close((err) => {
+    const fs = require('fs');
+    if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
+    db = new sqlite3.Database(dbPath);
+    initDb(db);
+    res.json({ success: true });
+  });
+});
+
 io.on('connection', (socket) => {
-  // При подключении к конкретной группе
   socket.on('join_group', (groupId) => {
     socket.join(`group_${groupId}`);
-    db.all("SELECT user, text FROM messages WHERE group_id = ? ORDER BY timestamp ASC LIMIT 50", [groupId], (err, rows) => {
+    db.all("SELECT * FROM messages WHERE group_id = ? ORDER BY timestamp ASC", [groupId], (err, rows) => {
       socket.emit('load_history', rows || []);
     });
   });
 
   socket.on('send_message', (data) => {
-    const { group_id, user, text } = data;
-    db.run("INSERT INTO messages (group_id, user, text) VALUES (?, ?, ?)", [group_id, user, text]);
-    io.to(`group_${group_id}`).emit('receive_message', data);
+    db.run("INSERT INTO messages (group_id, sender_id, user, text) VALUES (?, ?, ?, ?)", 
+      [data.group_id, data.sender_id, data.user, data.text], function() {
+        io.to(`group_${data.group_id}`).emit('receive_message', { ...data, id: this.lastID });
+    });
+  });
+
+  socket.on('delete_message', (msgId, groupId) => {
+    db.run("DELETE FROM messages WHERE id = ?", [msgId], () => {
+      io.to(`group_${groupId}`).emit('message_deleted', msgId);
+    });
   });
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server live on ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running`));
