@@ -1,64 +1,56 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const sqlite3 = require('sqlite3');
-const { open } = require('sqlite');
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
+const cors = require('cors');
 
 const app = express();
-const server = http.createServer(app);
+app.use(cors());
+app.use(express.json());
 
-// Настройка CORS важна для того, чтобы мобильное приложение могло подключиться
-const io = new Server(server, {
-  cors: {
-    origin: "*", 
-    methods: ["GET", "POST"]
-  }
+const server = http.createServer(app);
+const io = new Server(server, { 
+    cors: { origin: "*", methods: ["GET", "POST"] } 
 });
 
-(async () => {
-  // Инициализация базы данных SQLite
-  const db = await open({
-    filename: './database.sqlite',
-    driver: sqlite3.Database
-  });
+const db = new sqlite3.Database(path.resolve(__dirname, 'database.sqlite'));
 
-  // Создание таблицы сообщений
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user TEXT,
-      text TEXT,
-      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
+db.serialize(() => {
+    db.run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, password TEXT)");
+    db.run("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user TEXT, text TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)");
+});
 
-  io.on('connection', async (socket) => {
-    console.log('User connected:', socket.id);
+// Регистрация
+app.post('/register', (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ error: "Заполни все поля" });
+    
+    db.run("INSERT INTO users (username, password) VALUES (?, ?)", [username, password], function(err) {
+        if (err) return res.status(400).json({ error: "Имя уже занято" });
+        res.json({ success: true });
+    });
+});
 
-    // Отправляем историю при подключении
-    try {
-      const history = await db.all("SELECT user, text FROM messages ORDER BY timestamp ASC LIMIT 50");
-      socket.emit('load_history', history);
-    } catch (err) {
-      console.log("History error:", err);
-    }
+// Вход
+app.post('/login', (req, res) => {
+    const { username, password } = req.body;
+    db.get("SELECT * FROM users WHERE username = ? AND password = ?", [username, password], (err, row) => {
+        if (row) res.json({ success: true, username: row.username });
+        else res.status(401).json({ error: "Неверный логин или пароль" });
+    });
+});
 
-    // Обработка нового сообщения
-    socket.on('send_message', async (data) => {
-      if (data.user && data.text) {
-        await db.run("INSERT INTO messages (user, text) VALUES (?, ?)", [data.user, data.text]);
-        io.emit('receive_message', data); // Рассылка всем
-      }
+io.on('connection', (socket) => {
+    db.all("SELECT user, text FROM messages ORDER BY timestamp ASC LIMIT 50", (err, rows) => {
+        if (!err) socket.emit('load_history', rows);
     });
 
-    socket.on('disconnect', () => {
-      console.log('User disconnected');
+    socket.on('send_message', (data) => {
+        db.run("INSERT INTO messages (user, text) VALUES (?, ?)", [data.user, data.text]);
+        io.emit('receive_message', data);
     });
-  });
+});
 
-  // Render сам подставит нужный PORT
-  const PORT = process.env.PORT || 3000;
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server is running on port ${PORT}`);
-  });
-})();
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server running on port ${PORT}`));
