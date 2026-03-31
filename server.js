@@ -1,4 +1,4 @@
-require('dotenv').config(); // Загружает переменные из .env файла (для локального запуска)
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -11,68 +11,49 @@ app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, { 
-  cors: { origin: "*" } 
+  cors: { origin: "*" },
+  pingTimeout: 60000 
 });
 
 // --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ---
-// Используем переменную окружения DATABASE_URL, которую мы настроили в Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: {
+    // ВАЖНО: это исправляет ошибку "self-signed certificate"
+    rejectUnauthorized: false 
+  },
+  connectionTimeoutMillis: 10000 // Ждем 10 сек до ошибки
 });
 
-// Инициализация таблиц в Supabase
-const initDB = async () => {
+// Проверка подключения при старте
+const checkConnection = async () => {
   try {
-    const client = await pool.connect();
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email TEXT UNIQUE,
-        display_name TEXT,
-        username TEXT UNIQUE,
-        password TEXT
-      );
-      CREATE TABLE IF NOT EXISTS groups (
-        id SERIAL PRIMARY KEY,
-        name TEXT,
-        owner_id INTEGER,
-        is_private INTEGER DEFAULT 0
-      );
-      CREATE TABLE IF NOT EXISTS group_members (
-        group_id INTEGER,
-        user_id INTEGER
-      );
-      CREATE TABLE IF NOT EXISTS messages (
-        id SERIAL PRIMARY KEY,
-        group_id INTEGER,
-        sender_id INTEGER,
-        sender_name TEXT,
-        text TEXT,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-    client.release();
-    console.log("✅ База данных Supabase готова (таблицы проверены)");
+    const res = await pool.query('SELECT NOW()');
+    console.log("✅ СВЯЗЬ С SUPABASE УСТАНОВЛЕНА:", res.rows[0].now);
   } catch (err) {
-    console.error("❌ Ошибка подключения к БД:", err.message);
+    console.error("❌ ОШИБКА ПОДКЛЮЧЕНИЯ К БД:", err.message);
+    console.log("Подсказка: Проверь пароль и порт 6543 в настройках Render.");
   }
 };
-initDB();
+checkConnection();
 
 // --- API ЭНДПОИНТЫ ---
 
 // Регистрация
 app.post('/register', async (req, res) => {
-  const { email, display_name, username, password } = req.body;
+  let { email, display_name, username, password } = req.body;
   try {
-    const u = username.startsWith('@') ? username : `@${username}`;
+    const cleanEmail = email.trim().toLowerCase();
+    let cleanUsername = username.trim().toLowerCase();
+    if (!cleanUsername.startsWith('@')) cleanUsername = `@${cleanUsername}`;
+
     const result = await pool.query(
       "INSERT INTO users (email, display_name, username, password) VALUES ($1, $2, $3, $4) RETURNING id",
-      [email, display_name, u, password]
+      [cleanEmail, display_name.trim(), cleanUsername, password]
     );
     res.json({ id: result.rows[0].id, success: true });
   } catch (err) {
+    console.error("Ошибка регистрации:", err.detail || err.message);
     res.status(400).json({ error: "Email или Username уже заняты" });
   }
 });
@@ -81,14 +62,18 @@ app.post('/register', async (req, res) => {
 app.post('/login', async (req, res) => {
   const { email, password } = req.body;
   try {
-    const result = await pool.query("SELECT * FROM users WHERE email = $1 AND password = $2", [email, password]);
+    const cleanEmail = email.trim().toLowerCase();
+    const result = await pool.query(
+      "SELECT * FROM users WHERE LOWER(email) = $1 AND password = $2", 
+      [cleanEmail, password]
+    );
     if (result.rows.length > 0) {
       res.json(result.rows[0]);
     } else {
       res.status(401).json({ error: "Неверный email или пароль" });
     }
   } catch (err) {
-    res.status(500).json({ error: "Ошибка сервера" });
+    res.status(500).json({ error: "Ошибка сервера при входе" });
   }
 });
 
@@ -96,10 +81,11 @@ app.post('/login', async (req, res) => {
 app.post('/update-profile', async (req, res) => {
   const { id, display_name, username } = req.body;
   try {
-    const u = username.startsWith('@') ? username : `@${username}`;
+    let cleanUsername = username.trim().toLowerCase();
+    if (!cleanUsername.startsWith('@')) cleanUsername = `@${cleanUsername}`;
     await pool.query(
       "UPDATE users SET display_name = $1, username = $2 WHERE id = $3",
-      [display_name, u, id]
+      [display_name.trim(), cleanUsername, id]
     );
     const updated = await pool.query("SELECT * FROM users WHERE id = $1", [id]);
     res.json({ success: true, user: updated.rows[0] });
@@ -121,7 +107,7 @@ app.get('/my-chats/:uid', async (req, res) => {
   }
 });
 
-// Создание группы или приватного чата
+// Создание группы/чата
 app.post('/groups/create', async (req, res) => {
   const { name, owner_id, members, is_private } = req.body;
   try {
@@ -131,17 +117,16 @@ app.post('/groups/create', async (req, res) => {
     );
     const gid = groupRes.rows[0].id;
     const allMembers = Array.from(new Set([owner_id, ...members]));
-    
     for (let uid of allMembers) {
       await pool.query("INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)", [gid, uid]);
     }
     res.json({ id: gid });
   } catch (err) {
-    res.status(500).json({ error: "Ошибка при создании чата" });
+    res.status(500).json({ error: "Ошибка создания чата" });
   }
 });
 
-// Список контактов (все пользователи)
+// Список контактов
 app.get('/contacts/:uid', async (req, res) => {
   try {
     const result = await pool.query("SELECT id, display_name, username FROM users WHERE id != $1", [req.params.uid]);
@@ -152,7 +137,6 @@ app.get('/contacts/:uid', async (req, res) => {
 });
 
 // --- WEB SOCKETS ---
-
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
@@ -165,7 +149,7 @@ io.on('connection', (socket) => {
       );
       socket.emit('history', history.rows);
     } catch (err) {
-      console.error("Error loading history:", err);
+      console.error("Ошибка загрузки истории:", err.message);
     }
   });
 
@@ -177,7 +161,7 @@ io.on('connection', (socket) => {
       );
       io.to(`room_${data.group_id}`).emit('msg', data);
     } catch (err) {
-      console.error("Error saving message:", err);
+      console.error("Ошибка сохранения сообщения:", err.message);
     }
   });
 
@@ -186,7 +170,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// Запуск сервера
+// Запуск
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
   console.log(`🚀 Сервер запущен на порту ${PORT}`);
