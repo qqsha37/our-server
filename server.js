@@ -66,6 +66,26 @@ app.get('/contacts/:uid', (req, res) => {
   });
 });
 
+// Эндпоинт для обновления профиля
+app.post('/update-profile', (req, res) => {
+  const { id, display_name, username } = req.body;
+  const u = username.trim().startsWith('@') ? username.trim() : `@${username.trim()}`;
+
+  db.run(
+    "UPDATE users SET display_name = ?, username = ? WHERE id = ?",
+    [display_name, u, id],
+    function(err) {
+      if (err) {
+        return res.status(400).json({ error: "Этот юзернейм уже занят" });
+      }
+      // Возвращаем обновленные данные
+      db.get("SELECT * FROM users WHERE id = ?", [id], (err, row) => {
+        res.json({ success: true, user: row });
+      });
+    }
+  );
+});
+
 io.on('connection', (socket) => {
   socket.on('join', (gid) => {
     socket.join(`room_${gid}`);
