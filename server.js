@@ -18,7 +18,6 @@ let db;
 function initDb() {
   db = new sqlite3.Database(dbPath);
   db.serialize(() => {
-    // Пользователи
     db.run(`CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       email TEXT UNIQUE, 
@@ -27,14 +26,12 @@ function initDb() {
       password TEXT
     )`);
     
-    // Контакты (друзья)
     db.run(`CREATE TABLE IF NOT EXISTS contacts (
       user_id INTEGER, 
       contact_id INTEGER,
       UNIQUE(user_id, contact_id)
     )`);
 
-    // Группы
     db.run(`CREATE TABLE IF NOT EXISTS groups (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       name TEXT, 
@@ -43,13 +40,11 @@ function initDb() {
       is_group INTEGER DEFAULT 1
     )`);
 
-    // Участники групп
     db.run(`CREATE TABLE IF NOT EXISTS group_members (
       group_id INTEGER, 
       user_id INTEGER
     )`);
 
-    // Сообщения
     db.run(`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       group_id INTEGER, 
@@ -62,7 +57,7 @@ function initDb() {
 }
 initDb();
 
-// Поиск пользователя по юзернейму
+// ПОИСК: Находит пользователя по @username
 app.get('/users/search/:username', (req, res) => {
   const search = req.params.username.trim().toLowerCase();
   const query = search.startsWith('@') ? search : `@${search}`;
@@ -72,7 +67,13 @@ app.get('/users/search/:username', (req, res) => {
   });
 });
 
-// Добавить в друзья
+// ИСТОРИЯ: Загрузка сообщений для конкретного чата
+app.get('/messages/:groupId', (req, res) => {
+  db.all("SELECT * FROM messages WHERE group_id = ? ORDER BY timestamp ASC", [req.params.groupId], (err, rows) => {
+    res.json(rows || []);
+  });
+});
+
 app.post('/contacts/add', (req, res) => {
   const { user_id, contact_id } = req.body;
   db.run("INSERT OR IGNORE INTO contacts (user_id, contact_id) VALUES (?, ?)", [user_id, contact_id], () => {
@@ -80,7 +81,6 @@ app.post('/contacts/add', (req, res) => {
   });
 });
 
-// Получить список друзей
 app.get('/contacts/:userId', (req, res) => {
   db.all(`SELECT u.id, u.display_name, u.username FROM users u 
           JOIN contacts c ON u.id = c.contact_id WHERE c.user_id = ?`, [req.params.userId], (err, rows) => {
@@ -88,12 +88,11 @@ app.get('/contacts/:userId', (req, res) => {
   });
 });
 
-// Создание группы
 app.post('/groups/create', (req, res) => {
   const { name, description, owner_id, members } = req.body;
   db.run("INSERT INTO groups (name, description, owner_id) VALUES (?, ?, ?)", [name, description, owner_id], function(err) {
     const groupId = this.lastID;
-    const allMembers = [...members, owner_id];
+    const allMembers = [...new Set([...members, owner_id])]; 
     const stmt = db.prepare("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)");
     allMembers.forEach(mId => stmt.run(groupId, mId));
     stmt.finalize();
@@ -101,7 +100,6 @@ app.post('/groups/create', (req, res) => {
   });
 });
 
-// Получить чаты пользователя (и группы, и личные)
 app.get('/my-chats/:userId', (req, res) => {
   db.all(`SELECT g.* FROM groups g 
           JOIN group_members gm ON g.id = gm.group_id 
@@ -110,13 +108,12 @@ app.get('/my-chats/:userId', (req, res) => {
   });
 });
 
-// Стандартные эндпоинты (Login/Register/Reset) остаются из прошлых версий...
 app.post('/register', (req, res) => {
   const { email, display_name, username, password } = req.body;
   const e = email.trim().toLowerCase();
   const u = username.trim().startsWith('@') ? username.trim() : `@${username.trim()}`;
   db.run("INSERT INTO users (email, display_name, username, password) VALUES (?, ?, ?, ?)", [e, display_name, u, password], (err) => {
-    if (err) return res.status(400).json({ error: "Занято" });
+    if (err) return res.status(400).json({ error: "Email или Username уже заняты" });
     res.json({ success: true });
   });
 });
@@ -125,22 +122,22 @@ app.post('/login', (req, res) => {
   const { email, password } = req.body;
   db.get("SELECT * FROM users WHERE email = ? AND password = ?", [email.trim().toLowerCase(), password.trim()], (err, row) => {
     if (row) res.json({ success: true, ...row });
-    else res.status(401).json({ error: "Ошибка" });
+    else res.status(401).json({ error: "Неверные данные" });
   });
 });
 
-app.post('/admin/nuclear-reset', (req, res) => {
-  db.close(() => { fs.unlinkSync(dbPath); initDb(); io.emit('FORCE_LOGOUT'); res.json({ success: true }); });
-});
-
+// SOCKET.IO: Живое общение
 io.on('connection', (socket) => {
   socket.on('join', (id) => socket.join(`room_${id}`));
+  
   socket.on('msg', (data) => {
     db.run("INSERT INTO messages (group_id, sender_id, sender_name, text) VALUES (?, ?, ?, ?)", 
     [data.group_id, data.sender_id, data.sender_name, data.text], function() {
-      io.to(`room_${data.group_id}`).emit('msg', { ...data, id: this.lastID });
+      const newMessage = { ...data, id: this.lastID, timestamp: new Date().toISOString() };
+      io.to(`room_${data.group_id}`).emit('msg', newMessage);
     });
   });
 });
 
-server.listen(10000, '0.0.0.0');
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
