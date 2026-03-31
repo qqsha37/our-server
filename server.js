@@ -19,7 +19,6 @@ let db;
 function initDb() {
   db = new sqlite3.Database(dbPath);
   db.serialize(() => {
-    // Пользователи
     db.run(`CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       email TEXT UNIQUE, 
@@ -27,10 +26,9 @@ function initDb() {
       username TEXT UNIQUE, 
       password TEXT,
       bio TEXT,
-      avatar_url TEXT
+      birth_date TEXT
     )`);
     
-    // Группы/Чаты
     db.run(`CREATE TABLE IF NOT EXISTS groups (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       name TEXT, 
@@ -38,7 +36,6 @@ function initDb() {
       is_private INTEGER DEFAULT 0
     )`);
 
-    // Сообщения
     db.run(`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT, 
       group_id INTEGER, 
@@ -48,28 +45,43 @@ function initDb() {
       timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
 
-    // Создаем общий чат по умолчанию
-    db.run("INSERT OR IGNORE INTO groups (id, name, owner_id) VALUES (1, 'Global Community', 0)");
+    db.run("INSERT OR IGNORE INTO groups (id, name, owner_id) VALUES (1, 'Общий чат', 0)");
   });
 }
 
 initDb();
 
-// API
 app.post('/register', (req, res) => {
-  const { email, display_name, username, password } = req.body;
+  const email = req.body.email.trim().toLowerCase();
+  const password = req.body.password.trim();
+  const { display_name, username } = req.body;
+  const nick = username.trim().startsWith('@') ? username.trim() : `@${username.trim()}`;
+
   db.run("INSERT INTO users (email, display_name, username, password) VALUES (?, ?, ?, ?)", 
-    [email, display_name, username, password], function(err) {
-      if (err) return res.status(400).json({ error: "User already exists" });
+    [email, display_name.trim(), nick, password], function(err) {
+      if (err) {
+        console.error("Ошибка регистрации:", err.message);
+        return res.status(400).json({ error: "Email или Username уже заняты" });
+      }
       res.json({ success: true, id: this.lastID });
     });
 });
 
 app.post('/login', (req, res) => {
-  const { email, password } = req.body;
+  const email = req.body.email.trim().toLowerCase();
+  const password = req.body.password.trim();
+
+  console.log(`Попытка входа: ${email}`); // Для отладки в логах Render
+
   db.get("SELECT * FROM users WHERE email = ? AND password = ?", [email, password], (err, row) => {
-    if (row) res.json({ success: true, ...row });
-    else res.status(401).json({ error: "Invalid credentials" });
+    if (err) return res.status(500).json({ error: "Ошибка БД" });
+    if (row) {
+      console.log(`Успешный вход: ${row.username}`);
+      res.json({ success: true, ...row });
+    } else {
+      console.log(`Неудачный вход для: ${email}`);
+      res.status(401).json({ error: "Неверная почта или пароль" });
+    }
   });
 });
 
@@ -77,14 +89,12 @@ app.get('/groups', (req, res) => {
   db.all("SELECT * FROM groups", (err, rows) => res.json(rows || []));
 });
 
-// ГЛОБАЛЬНЫЙ СНОС БАЗЫ
 app.post('/admin/nuclear-reset', (req, res) => {
   db.close(() => {
     if (fs.existsSync(dbPath)) fs.unlinkSync(dbPath);
     initDb();
-    // Посылаем всем клиентам команду на принудительный логаут
     io.emit('FORCE_LOGOUT');
-    res.json({ success: true, message: "World resetted" });
+    res.json({ success: true, message: "База данных полностью очищена" });
   });
 });
 
@@ -112,4 +122,4 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, '0.0.0.0', () => console.log(`Server running`));
+server.listen(PORT, '0.0.0.0', () => console.log(`🚀 Сервер запущен`));
