@@ -1,7 +1,8 @@
+require('dotenv').config(); // Загружает переменные из .env файла (для локального запуска)
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const cors = require('cors');
 
 const app = express();
@@ -9,98 +10,184 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
-const db = new sqlite3.Database('./database.sqlite');
-
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE, display_name TEXT, username TEXT UNIQUE, password TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, owner_id INTEGER, is_private INTEGER DEFAULT 0)`);
-  db.run(`CREATE TABLE IF NOT EXISTS group_members (group_id INTEGER, user_id INTEGER)`);
-  db.run(`CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER, sender_id INTEGER, sender_name TEXT, text TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)`);
-  db.run(`CREATE TABLE IF NOT EXISTS contacts (user_id INTEGER, contact_id INTEGER)`);
+const io = new Server(server, { 
+  cors: { origin: "*" } 
 });
 
+// --- ПОДКЛЮЧЕНИЕ К БАЗЕ ДАННЫХ ---
+// Используем переменную окружения DATABASE_URL, которую мы настроили в Render
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Инициализация таблиц в Supabase
+const initDB = async () => {
+  try {
+    const client = await pool.connect();
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        email TEXT UNIQUE,
+        display_name TEXT,
+        username TEXT UNIQUE,
+        password TEXT
+      );
+      CREATE TABLE IF NOT EXISTS groups (
+        id SERIAL PRIMARY KEY,
+        name TEXT,
+        owner_id INTEGER,
+        is_private INTEGER DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS group_members (
+        group_id INTEGER,
+        user_id INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        group_id INTEGER,
+        sender_id INTEGER,
+        sender_name TEXT,
+        text TEXT,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+    client.release();
+    console.log("✅ База данных Supabase готова (таблицы проверены)");
+  } catch (err) {
+    console.error("❌ Ошибка подключения к БД:", err.message);
+  }
+};
+initDB();
+
+// --- API ЭНДПОИНТЫ ---
+
 // Регистрация
-app.post('/register', (req, res) => {
-  const { email, display_name, password } = req.body;
-  const username = email.split('@')[0]; // Простой юзернейм
-  db.run("INSERT INTO users (email, display_name, username, password) VALUES (?, ?, ?, ?)", 
-    [email, display_name, username, password], function(err) {
-      if (err) res.status(400).json({ error: "Email уже занят" });
-      else res.json({ id: this.lastID, success: true });
-  });
+app.post('/register', async (req, res) => {
+  const { email, display_name, username, password } = req.body;
+  try {
+    const u = username.startsWith('@') ? username : `@${username}`;
+    const result = await pool.query(
+      "INSERT INTO users (email, display_name, username, password) VALUES ($1, $2, $3, $4) RETURNING id",
+      [email, display_name, u, password]
+    );
+    res.json({ id: result.rows[0].id, success: true });
+  } catch (err) {
+    res.status(400).json({ error: "Email или Username уже заняты" });
+  }
 });
 
 // Вход
-app.post('/login', (req, res) => {
+app.post('/login', async (req, res) => {
   const { email, password } = req.body;
-  db.get("SELECT * FROM users WHERE email = ? AND password = ?", [email, password], (err, row) => {
-    if (row) res.json(row);
-    else res.status(401).json({ error: "Неверные данные" });
-  });
+  try {
+    const result = await pool.query("SELECT * FROM users WHERE email = $1 AND password = $2", [email, password]);
+    if (result.rows.length > 0) {
+      res.json(result.rows[0]);
+    } else {
+      res.status(401).json({ error: "Неверный email или пароль" });
+    }
+  } catch (err) {
+    res.status(500).json({ error: "Ошибка сервера" });
+  }
+});
+
+// Обновление профиля
+app.post('/update-profile', async (req, res) => {
+  const { id, display_name, username } = req.body;
+  try {
+    const u = username.startsWith('@') ? username : `@${username}`;
+    await pool.query(
+      "UPDATE users SET display_name = $1, username = $2 WHERE id = $3",
+      [display_name, u, id]
+    );
+    const updated = await pool.query("SELECT * FROM users WHERE id = $1", [id]);
+    res.json({ success: true, user: updated.rows[0] });
+  } catch (err) {
+    res.status(400).json({ error: "Этот юзернейм уже занят" });
+  }
 });
 
 // Список чатов пользователя
-app.get('/my-chats/:uid', (req, res) => {
-  const uid = req.params.uid;
-  db.all(`SELECT g.* FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_id = ?`, [uid], (err, rows) => {
-    res.json(rows || []);
-  });
+app.get('/my-chats/:uid', async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT g.* FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.user_id = $1",
+      [req.params.uid]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.json([]);
+  }
 });
 
-// Создание группы/чата
-app.post('/groups/create', (req, res) => {
+// Создание группы или приватного чата
+app.post('/groups/create', async (req, res) => {
   const { name, owner_id, members, is_private } = req.body;
-  db.run("INSERT INTO groups (name, owner_id, is_private) VALUES (?, ?, ?)", [name, owner_id, is_private], function() {
-    const gid = this.lastID;
-    const all = [owner_id, ...members];
-    all.forEach(uid => db.run("INSERT INTO group_members (group_id, user_id) VALUES (?, ?)", [gid, uid]));
-    res.json({ id: gid });
-  });
-});
-
-// Список контактов (пока просто все пользователи кроме себя для теста)
-app.get('/contacts/:uid', (req, res) => {
-  db.all("SELECT id, display_name, username FROM users WHERE id != ?", [req.params.uid], (err, rows) => {
-    res.json(rows || []);
-  });
-});
-
-// Эндпоинт для обновления профиля
-app.post('/update-profile', (req, res) => {
-  const { id, display_name, username } = req.body;
-  const u = username.trim().startsWith('@') ? username.trim() : `@${username.trim()}`;
-
-  db.run(
-    "UPDATE users SET display_name = ?, username = ? WHERE id = ?",
-    [display_name, u, id],
-    function(err) {
-      if (err) {
-        return res.status(400).json({ error: "Этот юзернейм уже занят" });
-      }
-      // Возвращаем обновленные данные
-      db.get("SELECT * FROM users WHERE id = ?", [id], (err, row) => {
-        res.json({ success: true, user: row });
-      });
+  try {
+    const groupRes = await pool.query(
+      "INSERT INTO groups (name, owner_id, is_private) VALUES ($1, $2, $3) RETURNING id",
+      [name, owner_id, is_private]
+    );
+    const gid = groupRes.rows[0].id;
+    const allMembers = Array.from(new Set([owner_id, ...members]));
+    
+    for (let uid of allMembers) {
+      await pool.query("INSERT INTO group_members (group_id, user_id) VALUES ($1, $2)", [gid, uid]);
     }
-  );
+    res.json({ id: gid });
+  } catch (err) {
+    res.status(500).json({ error: "Ошибка при создании чата" });
+  }
 });
+
+// Список контактов (все пользователи)
+app.get('/contacts/:uid', async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, display_name, username FROM users WHERE id != $1", [req.params.uid]);
+    res.json(result.rows);
+  } catch (err) {
+    res.json([]);
+  }
+});
+
+// --- WEB SOCKETS ---
 
 io.on('connection', (socket) => {
-  socket.on('join', (gid) => {
+  console.log('User connected:', socket.id);
+
+  socket.on('join', async (gid) => {
     socket.join(`room_${gid}`);
-    db.all("SELECT * FROM messages WHERE group_id = ? ORDER BY timestamp ASC", [gid], (err, rows) => {
-      socket.emit('history', rows || []);
-    });
+    try {
+      const history = await pool.query(
+        "SELECT * FROM messages WHERE group_id = $1 ORDER BY timestamp ASC", 
+        [gid]
+      );
+      socket.emit('history', history.rows);
+    } catch (err) {
+      console.error("Error loading history:", err);
+    }
   });
 
-  socket.on('msg', (data) => {
-    db.run("INSERT INTO messages (group_id, sender_id, sender_name, text) VALUES (?, ?, ?, ?)", 
-      [data.group_id, data.sender_id, data.sender_name, data.text], () => {
-        io.to(`room_${data.group_id}`).emit('msg', data);
-    });
+  socket.on('msg', async (data) => {
+    try {
+      await pool.query(
+        "INSERT INTO messages (group_id, sender_id, sender_name, text) VALUES ($1, $2, $3, $4)",
+        [data.group_id, data.sender_id, data.sender_name, data.text]
+      );
+      io.to(`room_${data.group_id}`).emit('msg', data);
+    } catch (err) {
+      console.error("Error saving message:", err);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected');
   });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Сервер запущен на порту ${PORT}`));
+// Запуск сервера
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => {
+  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+});
