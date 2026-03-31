@@ -88,14 +88,20 @@ app.post('/login', (req, res) => {
   });
 });
 
-// НОВЫЙ ЭНДПОИНТ: Поиск пользователя
+// Эндпоинт поиска: теперь регистронезависимый
 app.get('/users/search/:username', (req, res) => {
-  const q = req.params.username.trim();
-  const nick = q.startsWith('@') ? q : `@${q}`;
+  let q = req.params.username.trim();
+  // Убираем @ если пользователь его ввел, и приводим к нижнему регистру
+  const nick = q.startsWith('@') ? q.toLowerCase() : `@${q.toLowerCase()}`;
   
-  db.get("SELECT id, username, display_name FROM users WHERE username = ?", [nick], (err, row) => {
-    if (row) res.json(row);
-    else res.status(404).json({ error: "Не найден" });
+  // Используем LOWER в SQL для поиска без учета регистра
+  db.get("SELECT id, username, display_name FROM users WHERE LOWER(username) = ?", [nick], (err, row) => {
+    if (err) return res.status(500).json({ error: "Ошибка БД" });
+    if (row) {
+      res.json(row);
+    } else {
+      res.status(404).json({ error: "Пользователь не найден" });
+    }
   });
 });
 
